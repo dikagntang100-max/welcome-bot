@@ -1,0 +1,13 @@
+
+{
+  "name": "mawzz-welcome-bot",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node api/webhook.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0",
+    "telegraf": "^4.16.3"
+  }
+}

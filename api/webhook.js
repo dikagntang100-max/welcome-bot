@@ -11,417 +11,467 @@ const db = createClient(
 
 const SECRET = process.env.WEBHOOK_SECRET;
 
-const isGroup = chat =>
-  chat && ["group", "supergroup"].includes(chat.type);
+async function saveGroup(chat) {
+  await db.from("telegram_groups").upsert({
+    group_id: String(chat.id),
+    group_name: chat.title || "Telegram Group",
+    active: true
+  }, { onConflict: "group_id" });
+}
 
-const esc = s => String(s || "").replace(/[&<>"']/g, c => ({
-  "&": "&amp;", "<": "&lt;", ">": "&gt;",
-  '"': "&quot;", "'": "&#39;"
-})[c]);
+async function getGroup(groupId) {
+  const { data } = await db
+    .from("telegram_groups")
+    .select("*")
+    .eq("group_id", String(groupId))
+    .maybeSingle();
 
-async function admin(chatId, userId) {
+  return data;
+}
+
+async function isAdmin(ctx, groupId, userId) {
   try {
-    const m = await bot.telegram.getChatMember(chatId, userId);
-    return ["creator", "administrator"].includes(m.status);
+    const member = await ctx.telegram.getChatMember(
+      groupId,
+      userId
+    );
+
+    return ["creator", "administrator"].includes(member.status);
   } catch {
     return false;
   }
 }
 
-async function saveGroup(chat) {
-  await db.from("bot_groups").upsert({
-    chat_id: chat.id,
-    title: chat.title || "Telegram Group",
-    active: true
-  }, { onConflict: "chat_id" });
+async function setSetting(groupId, key, value) {
+  return db.from("telegram_settings").upsert({
+    group_id: String(groupId),
+    setting_key: key,
+    setting_value: String(value)
+  }, { onConflict: "group_id,setting_key" });
 }
 
-async function getGroup(id) {
-  const { data } = await db.from("bot_groups")
-    .select("*").eq("chat_id", id)
-    .eq("active", true).maybeSingle();
-  return data;
+async function getSetting(groupId, key, fallback = "") {
+  const { data } = await db
+    .from("telegram_settings")
+    .select("setting_value")
+    .eq("group_id", String(groupId))
+    .eq("setting_key", key)
+    .maybeSingle();
+
+  return data?.setting_value ?? fallback;
 }
 
-async function saveMember(chatId, user) {
-  if (!user || user.is_bot) return;
+function formatText(text, user, group) {
+  const name = user.first_name || "Member";
+  const username = user.username
+    ? "@" + user.username
+    : name;
 
-  await db.from("bot_group_members").upsert({
-    chat_id: chatId,
-    user_id: user.id,
-    first_name: user.first_name || "Member",
-    username: user.username || null,
-    is_bot: false,
-    last_seen_at: new Date().toISOString()
-  }, { onConflict: "chat_id,user_id" });
+  return text
+    .replaceAll("{name}", name)
+    .replaceAll("{username}", username)
+    .replaceAll("{id}", String(user.id))
+    .replaceAll("{group}", group.title || "Group");
 }
 
-function formatText(template, user, group) {
-  return String(template || "")
-    .replace(/\{name\}/gi, user.first_name || "Member")
-    .replace(/\{username\}/gi, user.username ? "@" + user.username : user.first_name || "Member")
-    .replace(/\{id\}/gi, String(user.id))
-    .replace(/\{group\}/gi, group.title || "Grup");
+async function groupMenu(ctx, groupId) {
+  const group = await getGroup(groupId);
+
+  if (!group) {
+    return ctx.reply("Grup belum terdaftar. Tambahkan bot ke grup terlebih dahulu.");
+  }
+
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback("Welcome ON/OFF", `toggle_welcome:${groupId}`)
+    ],
+    [
+      Markup.button.callback("Ubah teks welcome", `edit_welcome:${groupId}`)
+    ],
+    [
+      Markup.button.callback("Leave ON/OFF", `toggle_leave:${groupId}`)
+    ],
+    [
+      Markup.button.callback("Ubah teks leave", `edit_leave:${groupId}`)
+    ],
+    [
+      Markup.button.callback("Panduan Pin", `pin_help:${groupId}`),
+      Markup.button.callback("Panduan Tag All", `tag_help:${groupId}`)
+    ],
+    [
+      Markup.button.callback("Kembali", "home")
+    ]
+  ]);
+
+  await ctx.reply(
+    `⚙️ PENGATURAN GRUP\n\nNama: ${group.group_name}\nID: ${group.group_id}`,
+    keyboard
+  );
 }
 
-async function showGroups(ctx, edit = false) {
-  const { data } = await db.from("bot_groups")
-    .select("chat_id,title")
-    .eq("active", true)
-    .order("created_at", { ascending: false })
-    .limit(100);
+bot.start(async (ctx) => {
+  if (ctx.chat.type !== "private") return;
+
+  const { data: groups } = await db
+    .from("telegram_groups")
+    .select("group_id,group_name")
+    .eq("active", true);
 
   const buttons = [];
 
-  for (const g of data || []) {
-    if (await admin(g.chat_id, ctx.from.id)) {
+  for (const group of groups || []) {
+    if (await isAdmin(ctx, group.group_id, ctx.from.id)) {
       buttons.push([
         Markup.button.callback(
-          "📁 " + g.title.slice(0, 40),
-          "group:" + g.chat_id
+          group.group_name,
+          `select:${group.group_id}`
         )
       ]);
     }
   }
 
-  const text =
-    "👋 MAWZZ WELCOME BOT\n\n" +
-    "Pilih grup yang ingin kamu atur.";
-
   if (!buttons.length) {
-    const empty =
-      "👋 MAWZZ WELCOME BOT\n\n" +
-      "Belum ada grup yang bisa dikelola.\n\n" +
-      "1. Masukkan bot ke grup.\n" +
-      "2. Jadikan bot admin.\n" +
-      "3. Kamu juga harus admin grup.\n" +
-      "4. Tekan refresh.";
-
-    if (edit) return ctx.editMessageText(empty).catch(() => {});
-    return ctx.reply(empty);
+    return ctx.reply(
+      "👋 Selamat datang di MAWZZ WELCOME BOT PUBLIC!\n\n" +
+      "Tambahkan bot ke grup kamu, jadikan bot sebagai admin, " +
+      "lalu buka /start kembali untuk mengatur grup."
+    );
   }
 
-  buttons.push([
-    Markup.button.callback("🔄 Refresh", "refresh")
-  ]);
+  return ctx.reply(
+    "👋 MAWZZ WELCOME BOT PUBLIC\n\nPilih grup yang ingin kamu atur:",
+    Markup.inlineKeyboard(buttons)
+  );
+});
 
-  const keyboard = Markup.inlineKeyboard(buttons);
+bot.action("home", async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.deleteMessage().catch(() => {});
+  return ctx.reply("Ketik /start untuk memilih grup.");
+});
 
-  if (edit) {
-    return ctx.editMessageText(text, keyboard).catch(() => {});
-  }
-  return ctx.reply(text, keyboard);
-}
+bot.action(/^select:(-?\d+)$/, async (ctx) => {
+  const groupId = ctx.match[1];
 
-async function showMenu(ctx, id) {
-  if (!(await admin(id, ctx.from.id))) {
+  if (!(await isAdmin(ctx, groupId, ctx.from.id))) {
     return ctx.answerCbQuery("Khusus admin grup!", { show_alert: true });
   }
 
-  const g = await getGroup(id);
-  if (!g) return ctx.answerCbQuery("Grup tidak ditemukan.");
-
-  const text =
-    "⚙️ PENGATURAN GRUP\n\n" +
-    "📁 " + g.title + "\n" +
-    "👋 Sambutan: " + (g.welcome_enabled ? "Aktif ✅" : "Mati ❌") + "\n" +
-    "🚪 Pesan keluar: " + (g.leave_enabled ? "Aktif ✅" : "Mati ❌");
-
-  return ctx.editMessageText(text, Markup.inlineKeyboard([
-    [Markup.button.callback(
-      g.welcome_enabled ? "🔴 Matikan Sambutan" : "🟢 Aktifkan Sambutan",
-      "toggle_w:" + id
-    )],
-    [Markup.button.callback("✏️ Ubah Sambutan", "edit_w:" + id)],
-    [Markup.button.callback(
-      g.leave_enabled ? "🔴 Matikan Pesan Keluar" : "🟢 Aktifkan Pesan Keluar",
-      "toggle_l:" + id
-    )],
-    [Markup.button.callback("✏️ Ubah Pesan Keluar", "edit_l:" + id)],
-    [Markup.button.callback("📌 Panduan Pin", "pin_help")],
-    [Markup.button.callback("📢 Panduan Tag All", "tag_help")],
-    [Markup.button.callback("⬅️ Pilih Grup", "refresh")]
-  ])).catch(() => {});
-}
-
-async function setSession(userId, chatId, action) {
-  await db.from("bot_sessions").upsert({
-    user_id: userId,
-    chat_id: chatId,
-    action,
-    expires_at: new Date(Date.now() + 600000).toISOString()
-  }, { onConflict: "user_id" });
-}
-
-bot.start(async ctx => {
-  if (ctx.chat.type === "private") return showGroups(ctx);
-  return ctx.reply("✅ Bot aktif! Buka Private Chat bot dan ketik /start.");
-});
-
-bot.action("refresh", async ctx => {
   await ctx.answerCbQuery();
-  return showGroups(ctx, true);
+  await ctx.deleteMessage().catch(() => {});
+  return groupMenu(ctx, groupId);
 });
 
-bot.action(/^group:(-?\d+)$/, async ctx => {
+bot.action(/^(toggle_welcome|toggle_leave):(-?\d+)$/, async (ctx) => {
+  const action = ctx.match[1];
+  const groupId = ctx.match[2];
+
+  if (!(await isAdmin(ctx, groupId, ctx.from.id))) {
+    return ctx.answerCbQuery("Khusus admin grup!", { show_alert: true });
+  }
+
+  const group = await getGroup(groupId);
+  if (!group) return ctx.answerCbQuery("Grup tidak ditemukan.");
+
+  const column = action === "toggle_welcome"
+    ? "welcome_enabled"
+    : "leave_enabled";
+
+  const next = !group[column];
+
+  await db.from("telegram_groups")
+    .update({ [column]: next })
+    .eq("group_id", groupId);
+
+  await ctx.answerCbQuery(next ? "Berhasil diaktifkan!" : "Berhasil dimatikan!");
+  await ctx.deleteMessage().catch(() => {});
+  return groupMenu(ctx, groupId);
+});
+
+bot.action(/^(edit_welcome|edit_leave):(-?\d+)$/, async (ctx) => {
+  const type = ctx.match[1] === "edit_welcome" ? "welcome" : "leave";
+  const groupId = ctx.match[2];
+
+  if (!(await isAdmin(ctx, groupId, ctx.from.id))) {
+    return ctx.answerCbQuery("Khusus admin grup!", { show_alert: true });
+  }
+
+  await setSetting(groupId, `pending_${ctx.from.id}`, type);
+
   await ctx.answerCbQuery();
-  return showMenu(ctx, Number(ctx.match[1]));
-});
-
-bot.action(/^toggle_w:(-?\d+)$/, async ctx => {
-  const id = Number(ctx.match[1]);
-  if (!(await admin(id, ctx.from.id))) return ctx.answerCbQuery("Akses ditolak!");
-
-  const g = await getGroup(id);
-  if (!g) return ctx.answerCbQuery("Grup tidak ditemukan.");
-
-  await db.from("bot_groups")
-    .update({ welcome_enabled: !g.welcome_enabled })
-    .eq("chat_id", id);
-
-  await ctx.answerCbQuery("Berhasil diperbarui!");
-  return showMenu(ctx, id);
-});
-
-bot.action(/^toggle_l:(-?\d+)$/, async ctx => {
-  const id = Number(ctx.match[1]);
-  if (!(await admin(id, ctx.from.id))) return ctx.answerCbQuery("Akses ditolak!");
-
-  const g = await getGroup(id);
-  if (!g) return ctx.answerCbQuery("Grup tidak ditemukan.");
-
-  await db.from("bot_groups")
-    .update({ leave_enabled: !g.leave_enabled })
-    .eq("chat_id", id);
-
-  await ctx.answerCbQuery("Berhasil diperbarui!");
-  return showMenu(ctx, id);
-});
-
-bot.action(/^edit_w:(-?\d+)$/, async ctx => {
-  const id = Number(ctx.match[1]);
-  if (!(await admin(id, ctx.from.id))) return ctx.answerCbQuery("Akses ditolak!");
-
-  await setSession(ctx.from.id, id, "welcome");
-  await ctx.answerCbQuery();
-
   return ctx.reply(
-    "✏️ Kirim kata sambutan baru.\n\n" +
-    "Variabel:\n{name} = Nama member\n{username} = Username\n{id} = ID\n{group} = Nama grup\n\n" +
-    "Ketik /cancel untuk batal."
+    `Kirim teks ${type} baru untuk grup ini.\n\n` +
+    "Variabel yang tersedia:\n" +
+    "{name} = Nama member\n" +
+    "{username} = Username\n" +
+    "{id} = ID member\n" +
+    "{group} = Nama grup\n\n" +
+    "Ketik /cancel untuk membatalkan."
   );
 });
 
-bot.action(/^edit_l:(-?\d+)$/, async ctx => {
-  const id = Number(ctx.match[1]);
-  if (!(await admin(id, ctx.from.id))) return ctx.answerCbQuery("Akses ditolak!");
-
-  await setSession(ctx.from.id, id, "leave");
-  await ctx.answerCbQuery();
-
-  return ctx.reply(
-    "✏️ Kirim kata pesan keluar baru.\n\n" +
-    "Variabel: {name}, {username}, {id}, {group}\n\n" +
-    "Ketik /cancel untuk batal."
-  );
-});
-
-bot.action("pin_help", async ctx => {
-  await ctx.answerCbQuery();
-  return ctx.reply("📌 Balas pesan grup yang ingin disematkan, lalu ketik /pin.");
-});
-
-bot.action("tag_help", async ctx => {
-  await ctx.answerCbQuery();
-  return ctx.reply("📢 Gunakan /tagall Pesan kamu di grup. Hanya admin grup yang bisa.");
-});
-
-bot.command("cancel", async ctx => {
+bot.command("cancel", async (ctx) => {
   if (ctx.chat.type !== "private") return;
-  await db.from("bot_sessions").delete().eq("user_id", ctx.from.id);
-  return ctx.reply("❌ Dibatalkan. Ketik /start untuk kembali.");
+
+  const { data: groups } = await db
+    .from("telegram_groups")
+    .select("group_id");
+
+  for (const group of groups || []) {
+    await db.from("telegram_settings")
+      .delete()
+      .eq("group_id", group.group_id)
+      .eq("setting_key", `pending_${ctx.from.id}`);
+  }
+
+  return ctx.reply("Pengaturan dibatalkan.");
 });
 
-bot.command("pin", async ctx => {
-  if (!isGroup(ctx.chat)) return ctx.reply("Gunakan di grup.");
-  if (!(await admin(ctx.chat.id, ctx.from.id))) {
-    return ctx.reply("❌ Khusus admin grup.");
-  }
-
-  const target = ctx.message.reply_to_message;
-  if (!target) return ctx.reply("Balas pesan yang ingin dipin, lalu ketik /pin.");
-
-  try {
-    await ctx.telegram.pinChatMessage(ctx.chat.id, target.message_id, {
-      disable_notification: true
-    });
-    return ctx.reply("📌 Pesan berhasil disematkan!");
-  } catch {
-    return ctx.reply("❌ Bot belum punya izin pin pesan.");
-  }
+bot.action(/^pin_help:(-?\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  return ctx.reply(
+    "📌 CARA PIN PESAN\n\n" +
+    "Balas pesan yang ingin dipin, lalu ketik /pin di grup."
+  );
 });
 
-bot.command("tagall", async ctx => {
-  if (!isGroup(ctx.chat)) return ctx.reply("Gunakan di grup.");
-  if (!(await admin(ctx.chat.id, ctx.from.id))) {
-    return ctx.reply("❌ Khusus admin grup.");
-  }
-
-  const g = await getGroup(ctx.chat.id);
-  if (!g) return ctx.reply("Grup belum terdaftar.");
-
-  if (g.last_tag_at &&
-      Date.now() - new Date(g.last_tag_at).getTime() < 30000) {
-    return ctx.reply("⏳ Tunggu 30 detik sebelum tagall lagi.");
-  }
-
-  await db.from("bot_groups")
-    .update({ last_tag_at: new Date().toISOString() })
-    .eq("chat_id", ctx.chat.id);
-
-  const message = ctx.message.text
-    .replace(/^\/tagall(?:@\w+)?\s*/i, "").trim();
-
-  const { data: members } = await db.from("bot_group_members")
-    .select("user_id,first_name")
-    .eq("chat_id", ctx.chat.id)
-    .eq("is_bot", false)
-    .limit(500);
-
-  if (!members?.length) {
-    return ctx.reply("Belum ada member tercatat.");
-  }
-
-  await ctx.reply("📢 " + (message || "Halo semuanya!"));
-
-  for (let i = 0; i < members.length; i += 10) {
-    const mentions = members.slice(i, i + 10).map(m =>
-      '<a href="tg://user?id=' + m.user_id + '">' +
-      esc(m.first_name || "Member") + '</a>'
-    );
-
-    try {
-      await ctx.telegram.sendMessage(
-        ctx.chat.id,
-        mentions.join(" | "),
-        { parse_mode: "HTML" }
-      );
-    } catch (e) {
-      console.error(e.message);
-    }
-  }
+bot.action(/^tag_help:(-?\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  return ctx.reply(
+    "📢 CARA TAG ALL\n\n" +
+    "Ketik /tagall di grup untuk menyebut member yang pernah terdeteksi bot.\n\n" +
+    "Catatan: Telegram tidak mengizinkan bot mengambil seluruh daftar anggota grup secara bebas."
+  );
 });
 
-// BOT MASUK ATAU KELUAR GRUP
-bot.on("my_chat_member", async ctx => {
-  const update = ctx.myChatMember;
-  if (!isGroup(update.chat)) return;
+bot.on("my_chat_member", async (ctx) => {
+  const chat = ctx.chat;
+  const status = ctx.update.my_chat_member.new_chat_member.status;
 
-  const status = update.new_chat_member.status;
+  if (!["group", "supergroup"].includes(chat.type)) return;
 
   if (["member", "administrator"].includes(status)) {
-    await saveGroup(update.chat);
+    await saveGroup(chat);
   } else if (["left", "kicked"].includes(status)) {
-    await db.from("bot_groups")
+    await db.from("telegram_groups")
       .update({ active: false })
-      .eq("chat_id", update.chat.id);
+      .eq("group_id", String(chat.id));
   }
 });
 
-// SEMUA PESAN
-bot.on("message", async ctx => {
-  const m = ctx.message;
+bot.on("new_chat_members", async (ctx) => {
+  const group = ctx.chat;
+  await saveGroup(group);
 
-  // PROSES PENGATURAN PRIVATE CHAT
-  if (ctx.chat.type === "private" && m.text) {
-    const { data: s } = await db.from("bot_sessions")
-      .select("*").eq("user_id", ctx.from.id).maybeSingle();
+  const settings = await getGroup(group.id);
+  if (!settings?.welcome_enabled) return;
 
-    if (!s) return;
+  for (const user of ctx.message.new_chat_members) {
+    if (user.is_bot) continue;
 
-    if (new Date(s.expires_at).getTime() < Date.now()) {
-      await db.from("bot_sessions").delete().eq("user_id", ctx.from.id);
-      return ctx.reply("Waktu pengaturan habis. Ketik /start.");
+    await db.from("telegram_members").upsert({
+      group_id: String(group.id),
+      user_id: String(user.id),
+      first_name: user.first_name,
+      username: user.username || null,
+      last_seen: new Date().toISOString()
+    }, { onConflict: "group_id,user_id" });
+
+    const message = formatText(
+      settings.welcome_text,
+      user,
+      group
+    );
+
+    await ctx.reply(message);
+  }
+});
+
+bot.on("left_chat_member", async (ctx) => {
+  const group = ctx.chat;
+  const user = ctx.message.left_chat_member;
+
+  const settings = await getGroup(group.id);
+
+  await db.from("telegram_members")
+    .delete()
+    .eq("group_id", String(group.id))
+    .eq("user_id", String(user.id));
+
+  if (!settings?.leave_enabled || user.is_bot) return;
+
+  await ctx.reply(
+    formatText(settings.leave_text, user, group)
+  );
+});
+
+bot.on("message", async (ctx) => {
+  const message = ctx.message;
+
+  if (ctx.chat.type === "private") {
+    if (!message.text || message.text.startsWith("/")) return;
+
+    const { data: groups } = await db
+      .from("telegram_groups")
+      .select("group_id");
+
+    for (const group of groups || []) {
+      const key = `pending_${ctx.from.id}`;
+
+      const { data } = await db.from("telegram_settings")
+        .select("setting_value")
+        .eq("group_id", group.group_id)
+        .eq("setting_key", key)
+        .maybeSingle();
+
+      if (!data) continue;
+
+      if (!(await isAdmin(ctx, group.group_id, ctx.from.id))) {
+        await db.from("telegram_settings")
+          .delete()
+          .eq("group_id", group.group_id)
+          .eq("setting_key", key);
+        continue;
+      }
+
+      const type = data.setting_value;
+      const column = type === "welcome" ? "welcome_text" : "leave_text";
+
+      await db.from("telegram_groups")
+        .update({ [column]: message.text })
+        .eq("group_id", group.group_id);
+
+      await db.from("telegram_settings")
+        .delete()
+        .eq("group_id", group.group_id)
+        .eq("setting_key", key);
+
+      return ctx.reply(`✅ Teks ${type} berhasil diperbarui!`);
     }
 
-    if (!(await admin(s.chat_id, ctx.from.id))) {
-      await db.from("bot_sessions").delete().eq("user_id", ctx.from.id);
-      return ctx.reply("❌ Akses admin tidak ditemukan.");
-    }
-
-    const value = m.text.trim();
-    if (!value || value.length > 1500) {
-      return ctx.reply("Teks harus 1–1500 karakter.");
-    }
-
-    const column = s.action === "welcome" ? "welcome_text" : "leave_text";
-
-    const { error } = await db.from("bot_groups")
-      .update({ [column]: value })
-      .eq("chat_id", s.chat_id);
-
-    await db.from("bot_sessions").delete().eq("user_id", ctx.from.id);
-
-    if (error) return ctx.reply("❌ Gagal menyimpan.");
-
-    return ctx.reply("✅ Kata-kata berhasil disimpan!");
+    return;
   }
 
-  if (!isGroup(ctx.chat)) return;
+  if (!["group", "supergroup"].includes(ctx.chat.type)) return;
 
   await saveGroup(ctx.chat);
 
-  if (m.from) await saveMember(ctx.chat.id, m.from);
-
-  // MEMBER MASUK
-  if (m.new_chat_members) {
-    for (const user of m.new_chat_members) {
-      if (user.is_bot) continue;
-
-      await saveMember(ctx.chat.id, user);
-      const g = await getGroup(ctx.chat.id);
-
-      if (g && g.welcome_enabled) {
-        await ctx.reply(formatText(g.welcome_text, user, g));
-      }
-    }
-  }
-
-  // MEMBER KELUAR
-  if (m.left_chat_member) {
-    const user = m.left_chat_member;
-
-    await db.from("bot_group_members")
-      .delete().eq("chat_id", ctx.chat.id)
-      .eq("user_id", user.id);
-
-    if (user.is_bot) return;
-
-    const g = await getGroup(ctx.chat.id);
-
-    if (g && g.leave_enabled) {
-      await ctx.reply(formatText(g.leave_text, user, g));
-    }
+  if (message.from && !message.from.is_bot) {
+    await db.from("telegram_members").upsert({
+      group_id: String(ctx.chat.id),
+      user_id: String(message.from.id),
+      first_name: message.from.first_name,
+      username: message.from.username || null,
+      last_seen: new Date().toISOString()
+    }, { onConflict: "group_id,user_id" });
   }
 });
 
-bot.catch(err => console.error("BOT ERROR:", err.message));
+bot.command("pin", async (ctx) => {
+  if (!["group", "supergroup"].includes(ctx.chat.type)) return;
+
+  if (!(await isAdmin(ctx, ctx.chat.id, ctx.from.id))) {
+    return ctx.reply("Hanya admin grup yang bisa menggunakan perintah ini.");
+  }
+
+  if (!ctx.message.reply_to_message) {
+    return ctx.reply("Balas pesan yang ingin dipin, lalu ketik /pin.");
+  }
+
+  try {
+    await ctx.telegram.pinChatMessage(
+      ctx.chat.id,
+      ctx.message.reply_to_message.message_id
+    );
+    return ctx.reply("📌 Pesan berhasil dipin!");
+  } catch {
+    return ctx.reply("Gagal pin. Pastikan bot punya izin pin pesan.");
+  }
+});
+
+bot.command("tagall", async (ctx) => {
+  if (!["group", "supergroup"].includes(ctx.chat.type)) return;
+
+  if (!(await isAdmin(ctx, ctx.chat.id, ctx.from.id))) {
+    return ctx.reply("Hanya admin grup yang bisa menggunakan perintah ini.");
+  }
+
+  const groupId = String(ctx.chat.id);
+  const settings = await getGroup(groupId);
+
+  if (!settings?.tagall_enabled) {
+    return ctx.reply("Fitur Tag All sedang dimatikan.");
+  }
+
+  const { data: cooldown } = await db
+    .from("telegram_tagall_cooldowns")
+    .select("last_used")
+    .eq("group_id", groupId)
+    .maybeSingle();
+
+  if (
+    cooldown &&
+    Date.now() - new Date(cooldown.last_used).getTime() < 60000
+  ) {
+    return ctx.reply("Tunggu 60 detik sebelum menggunakan Tag All lagi.");
+  }
+
+  await db.from("telegram_tagall_cooldowns").upsert({
+    group_id: groupId,
+    last_used: new Date().toISOString()
+  }, { onConflict: "group_id" });
+
+  const { data: members } = await db
+    .from("telegram_members")
+    .select("user_id,first_name")
+    .eq("group_id", groupId)
+    .limit(30);
+
+  if (!members?.length) {
+    return ctx.reply("Belum ada member yang terdeteksi bot.");
+  }
+
+  const customText = ctx.message.text.replace(/^\/tagall(@\w+)?\s*/i, "");
+  const mentions = members.map(member => {
+    const name = (member.first_name || "Member")
+      .replace(/[<>&]/g, "");
+    return `<a href="tg://user?id=${member.user_id}">${name}</a>`;
+  });
+
+  const chunks = [];
+  for (let i = 0; i < mentions.length; i += 10) {
+    chunks.push(mentions.slice(i, i + 10));
+  }
+
+  for (const chunk of chunks) {
+    await ctx.reply(
+      `${customText ? customText + "\n" : ""}${chunk.join(" ")}`,
+      { parse_mode: "HTML", disable_web_page_preview: true }
+    );
+  }
+});
+
+bot.catch((err) => {
+  console.error("BOT ERROR:", err);
+});
 
 module.exports = async (req, res) => {
   if (req.method !== "POST") {
-    return res.status(200).send("MAWZZ WELCOME BOT ONLINE");
+    return res.status(200).send("MAWZZ WELCOME BOT ACTIVE");
   }
 
-  if (!SECRET ||
-      req.headers["x-telegram-bot-api-secret-token"] !== SECRET) {
-    return res.status(401).send("Unauthorized");
+  if (
+    SECRET &&
+    req.headers["x-telegram-bot-api-secret-token"] !== SECRET
+  ) {
+    return res.status(403).send("Forbidden");
   }
 
   try {
     await bot.handleUpdate(req.body);
     return res.status(200).send("OK");
-  } catch (err) {
-    console.error("WEBHOOK ERROR:", err.message);
+  } catch (error) {
+    console.error("WEBHOOK ERROR:", error);
     return res.status(200).send("OK");
   }
 };
